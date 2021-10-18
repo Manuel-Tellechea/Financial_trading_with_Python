@@ -46,7 +46,7 @@ class TickerBase():
         self.ticker = ticker.upper()
         self.session = session or _requests
         self._history = None
-        self._base_url = 'https://query1.finance.yahoo.com'
+        self._base_url = 'https://query2.finance.yahoo.com'
         self._scrape_url = 'https://finance.yahoo.com/quote'
 
         self._fundamentals = False
@@ -149,7 +149,12 @@ class TickerBase():
 
         # Getting data from json
         url = "{}/v8/finance/chart/{}".format(self._base_url, self.ticker)
-        data = self.session.get(url=url, params=params, proxies=proxy)
+        data = self.session.get(
+            url=url,
+            params=params,
+            proxies=proxy,
+            headers=utils.user_agent_headers
+        )
         if "Will be right back" in data.text:
             raise RuntimeError("*** YAHOO! FINANCE IS CURRENTLY DOWN! ***\n"
                                "Our engineers are working quickly to resolve "
@@ -208,10 +213,20 @@ class TickerBase():
             except Exception:
                 pass
 
-        if auto_adjust:
-            quotes = utils.auto_adjust(quotes)
-        elif back_adjust:
-            quotes = utils.back_adjust(quotes)
+        try:
+            if auto_adjust:
+                quotes = utils.auto_adjust(quotes)
+            elif back_adjust:
+                quotes = utils.back_adjust(quotes)
+        except Exception as e:
+            if auto_adjust:
+                err_msg = "auto_adjust failed with %s" % e
+            else:
+                err_msg = "back_adjust failed with %s" % e
+            shared._DFS[self.ticker] = utils.empty_df()
+            shared._ERRORS[self.ticker] = err_msg
+            if "many" not in kwargs and debug_mode:
+                print('- %s: %s' % (self.ticker, err_msg))
 
         if rounding:
             quotes = _np.round(quotes, data[
@@ -241,6 +256,11 @@ class TickerBase():
             if tz is not None:
                 df.index = df.index.tz_localize(tz)
             df.index.name = "Date"
+
+        # duplicates and missing rows cleanup
+        df.dropna(how='all', inplace=True)
+        df.drop_duplicates(inplace=True)
+        df = df.groupby(df.index).last()
 
         self._history = df.copy()
 
@@ -286,20 +306,19 @@ class TickerBase():
 
         # holders
         try:
-            resp = self.session.get(ticker_url + '/holders')
-            resp.raise_for_status()
-            holders = _pd.read_html(resp.content)
+            resp = utils.get_html(ticker_url + '/holders', proxy, self.session)
+            holders = _pd.read_html(resp)
         except Exception as e:
             holders = []
 
-        if len(holders)>=3:
+        if len(holders) >= 3:
             self._major_holders = holders[0]
             self._institutional_holders = holders[1]
             self._mutualfund_holders = holders[2]
-        elif len(holders)>=2:
+        elif len(holders) >= 2:
             self._major_holders = holders[0]
             self._institutional_holders = holders[1]
-        elif len(holders)>=1:
+        elif len(holders) >= 1:
             self._major_holders = holders[0]
 
         #self._major_holders = holders[0]
@@ -308,18 +327,18 @@ class TickerBase():
         if self._institutional_holders is not None:
             if 'Date Reported' in self._institutional_holders:
                 self._institutional_holders['Date Reported'] = _pd.to_datetime(
-                self._institutional_holders['Date Reported'])
+                    self._institutional_holders['Date Reported'])
             if '% Out' in self._institutional_holders:
                 self._institutional_holders['% Out'] = self._institutional_holders[
-                '% Out'].str.replace('%', '').astype(float)/100
+                    '% Out'].str.replace('%', '').astype(float)/100
 
         if self._mutualfund_holders is not None:
             if 'Date Reported' in self._mutualfund_holders:
                 self._mutualfund_holders['Date Reported'] = _pd.to_datetime(
-                self._mutualfund_holders['Date Reported'])
+                    self._mutualfund_holders['Date Reported'])
             if '% Out' in self._mutualfund_holders:
                 self._mutualfund_holders['% Out'] = self._mutualfund_holders[
-                '% Out'].str.replace('%', '').astype(float)/100
+                    '% Out'].str.replace('%', '').astype(float)/100
 
         # sustainability
         d = {}
@@ -343,7 +362,7 @@ class TickerBase():
         # info (be nice to python 2)
         self._info = {}
         try:
-            items = ['summaryProfile', 'summaryDetail', 'quoteType',
+            items = ['summaryProfile', 'financialData', 'quoteType',
                      'defaultKeyStatistics', 'assetProfile', 'summaryDetail']
             for item in items:
                 if isinstance(data.get(item), dict):
@@ -351,10 +370,14 @@ class TickerBase():
         except Exception:
             pass
 
+        if not isinstance(data.get('summaryDetail'), dict):
+            # For some reason summaryDetail did not give any results. The price dict usually has most of the same info
+            self._info.update(data.get('price', {}))
+
         try:
             # self._info['regularMarketPrice'] = self._info['regularMarketOpen']
             self._info['regularMarketPrice'] = data.get('price', {}).get(
-                'regularMarketPrice', self._info['regularMarketOpen'])
+                'regularMarketPrice', self._info.get('regularMarketOpen', None))
         except Exception:
             pass
 
@@ -522,20 +545,26 @@ class TickerBase():
     def get_dividends(self, proxy=None):
         if self._history is None:
             self.history(period="max", proxy=proxy)
-        dividends = self._history["Dividends"]
-        return dividends[dividends != 0]
+        if self._history is not None and "Dividends" in self._history:
+            dividends = self._history["Dividends"]
+            return dividends[dividends != 0]
+        return []
 
     def get_splits(self, proxy=None):
         if self._history is None:
             self.history(period="max", proxy=proxy)
-        splits = self._history["Stock Splits"]
-        return splits[splits != 0]
+        if self._history is not None and "Stock Splits" in self._history:
+            splits = self._history["Stock Splits"]
+            return splits[splits != 0]
+        return []
 
     def get_actions(self, proxy=None):
         if self._history is None:
             self.history(period="max", proxy=proxy)
-        actions = self._history[["Dividends", "Stock Splits"]]
-        return actions[actions != 0].dropna(how='all').fillna(0)
+        if self._history is not None and "Dividends" in self._history and "Stock Splits" in self._history:
+            actions = self._history[["Dividends", "Stock Splits"]]
+            return actions[actions != 0].dropna(how='all').fillna(0)
+        return []
 
     def get_isin(self, proxy=None):
         # *** experimental ***
@@ -562,7 +591,11 @@ class TickerBase():
         url = 'https://markets.businessinsider.com/ajax/' \
               'SearchController_Suggest?max_results=25&query=%s' \
             % urlencode(q)
-        data = self.session.get(url=url, proxies=proxy).text
+        data = self.session.get(
+            url=url,
+            proxies=proxy,
+            headers=utils.user_agent_headers
+        ).text
 
         search_str = '"{}|'.format(ticker)
         if search_str not in data:

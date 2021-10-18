@@ -31,6 +31,7 @@ import pandas as _pd
 # import re as _re
 from collections import namedtuple as _namedtuple
 
+from . import utils
 from .base import TickerBase
 
 
@@ -53,13 +54,17 @@ class Ticker(TickerBase):
                 proxy = proxy["https"]
             proxy = {"https": proxy}
 
-        r = _requests.get(url=url, proxies=proxy).json()
-        if r['optionChain']['result']:
+        r = _requests.get(
+            url=url,
+            proxies=proxy,
+            headers=utils.user_agent_headers
+        ).json()
+        if len(r.get('optionChain', {}).get('result', [])) > 0:
             for exp in r['optionChain']['result'][0]['expirationDates']:
                 self._expirations[_datetime.datetime.utcfromtimestamp(
                     exp).strftime('%Y-%m-%d')] = exp
-            return r['optionChain']['result'][0]['options'][0]
-        return {}
+            opt = r['optionChain']['result'][0].get('options', [])
+            return opt[0] if len(opt) > 0 else []
 
     def _options2df(self, opt, tz=None):
         data = _pd.DataFrame(opt).reindex(columns=[
